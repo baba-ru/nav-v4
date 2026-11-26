@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>総合ナビ v4（測位エンジン＋実データ施設・ルート）</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        body, html { width: 100%; height: 100%; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; background: #0f172a; color: #f8fafc; }
+        #map { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; transition: transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1); transform-origin: 50% 100%; will-change: transform; }
+        /* バードビュー：地図を奥へ傾けた疑似3D表示。HUDやボタンは傾けない（地図だけに適用）。
+           底辺（画面下端）を支点に傾けるのがポイント：
+           - 上辺は奥へ倒れて細く・低くなるため、傾けた地図の見かけの高さは
+             画面の約70%（下から70%）になり、残りの上部約30%に空が現れる
+           横方向の対策（今回の拡張）：
+           - 傾けると上辺は元の幅の約84%まで細くなり、左右の表示範囲が狭くなる。
+             そこでバード時だけ地図コンテナ自体を画面幅の150%（左右に25%ずつ拡張）に
+             広げる。引き伸ばしではなくコンテナを広げるので、Leafletが実際に
+             左右の広い範囲のタイルを描く（invalidateSizeで再計算させる）。
+           - 150%幅の上辺は傾けても約126%幅が残るため、地平線いっぱいに地図が
+             広がり、左右に空・霞の隙間も切れ目も出ない。底辺側は画面外へ
+             はみ出すが、はみ出し＝切れではなく「より広く見える」方向に働く */
+        body { --bird-tilt: 34deg; --bird-horizon: 30vh; }
+        body.bird-view-active #map {
+            width: 150vw;
+            left: -25vw;
+            /* 角度は --bird-tilt で可変（初期34°＝見かけの高さ約70%）。
+               バード中は2本指の上下スライドで JS がこの変数を書き換える */
+            transform: perspective(2400px) rotateX(var(--bird-tilt, 34deg));
+            box-shadow: 0 -10px 44px rgba(30, 80, 130, 0.45);
+        }
+        /* 2本指で角度を動かしている間はアニメーションを切り、指に直接追随させる */
+        body.bird-gesturing #map { transition: none !important; }
+        body.bird-view-active { background: #8ec7ef; }
+        /* バードビュー時の「空」レイヤー（地図の背面いっぱい）。
+           上部約30%が空、それより下は地平線の霞色にして、
+           傾けた地図の斜めの側辺の外側も霞として自然に見せる */
+        .bird-sky {
+            display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 0;
+            pointer-events: none; overflow: hidden;
+            background: linear-gradient(180deg,
+                #4b9ede 0%, #74b6ea 16%, #a5d2f4 26%,
+                #e6f2fc 30.5%, #dfe7ea 38%, #d3dade 100%);
+        }
+        body.bird-view-active .bird-sky { display: block; }
+        /* 地平線の霞（地図の上辺が来る高さ＝上から約30%の位置に重ねる） */
+        .bird-sky::after {
+            content: ""; position: absolute; left: 0; right: 0; top: calc(var(--bird-horizon, 30vh) - 20px); height: 40px;
+            background: linear-gradient(180deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.65) 50%, rgba(255,255,255,0) 100%);
+        }
+        /* 太陽の光 */
+        .bird-sky .sun {
+            position: absolute; top: 3.5vh; right: 11vw; width: 120px; height: 120px; border-radius: 50%;
+            background: radial-gradient(circle, rgba(255,252,230,0.95) 0%, rgba(255,240,190,0.55) 32%, rgba(255,240,190,0) 68%);
+        }
+        /* 雲（CSSの丸みだけで描く・上部30%の空の中だけに置く） */
+        .bird-sky .cloud {
+            position: absolute; background: rgba(255,255,255,0.92); border-radius: 999px;
+            height: 16px; filter: blur(1px);
+        }
+        .bird-sky .cloud::before, .bird-sky .cloud::after {
+            content: ""; position: absolute; background: inherit; border-radius: 50%;
+        }
+        .bird-sky .cloud::before { width: 34px; height: 34px; top: -18px; left: 18px; }
+        .bird-sky .cloud::after  { width: 24px; height: 24px; top: -11px; right: 16px; }
+        .bird-sky .cloud.c1 { top: 6vh;  left: 7vw;  width: 92px;  opacity: 0.95; }
+        .bird-sky .cloud.c2 { top: 13vh; left: 52vw; width: 70px;  opacity: 0.8; transform: scale(0.8); }
+        .bird-sky .cloud.c3 { top: 19vh; left: 22vw; width: 58px;  opacity: 0.65; transform: scale(0.65); }
+        .bird-sky .cloud.c4 { top: 9vh;  left: 74vw; width: 80px;  opacity: 0.85; transform: scale(0.9); }
+        .bird-badge {
+            display: none; position: absolute; bottom: 150px; left: 12px; z-index: 1000;
+            background: rgba(37,99,235,0.92); color: #fff; font-size: 0.7rem; font-weight: bold;
+            padding: 5px 10px; border-radius: 8px; pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        body.bird-view-active .bird-badge { display: block; }
+
+        .persistent-restore-btn {
+            display: none; position: absolute; top: 15px; right: 15px; z-index: 3000;
+            background: #0284c7; color: #fff; border: 2px solid #38bdf8; padding: 10px 16px;
+            border-radius: 12px; font-size: 0.85rem; font-weight: bold;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.8); cursor: pointer; backdrop-filter: blur(10px);
+        }
+        body.ui-hidden .persistent-restore-btn { display: block !important; }
+        body.ui-hidden .top-tile-bar, body.ui-hidden .control-panel-group,
+        body.ui-hidden .hud-panel, body.ui-hidden .lever-panel, body.ui-hidden .toast { display: none !important; }
+
+        .top-tile-bar {
+            position: absolute; top: 12px; left: 12px; right: 12px; z-index: 1000;
+            display: flex; flex-wrap: wrap; gap: 6px; pointer-events: none;
+        }
+        .tile-btn {
+            pointer-events: auto; border: none; padding: 8px 14px; border-radius: 16px;
+            font-size: 0.78rem; font-weight: bold; cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.4); display: flex; align-items: center; gap: 4px;
+            transition: transform 0.1s ease, filter 0.2s ease;
+        }
+        .tile-btn:active { transform: scale(0.96); filter: brightness(1.1); }
+        .tile-btn.on { outline: 2px solid #fff; filter: brightness(1.25); }
+        .btn-barrier { background: linear-gradient(135deg, #0284c7, #0369a1); color: #fff; }
+        .btn-station { background: linear-gradient(135deg, #0d9488, #0f766e); color: #fff; }
+        .btn-bus     { background: linear-gradient(135deg, #059669, #047857); color: #fff; }
+        .btn-hospital{ background: linear-gradient(135deg, #dc2626, #991b1b); color: #fff; }
+        .btn-cvs     { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
+        .btn-gs      { background: linear-gradient(135deg, #d97706, #b45309); color: #fff; }
+        .btn-csv     { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
+
+        .control-panel-group {
+            position: absolute; top: 120px; right: 12px; z-index: 1000;
+            display: flex; flex-direction: column; gap: 8px;
+        }
+        .panel-box {
+            background: rgba(15,23,42,0.9); padding: 8px; border-radius: 14px;
+            backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.15);
+            display: flex; gap: 6px; box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+        }
+        .panel-box.vertical { flex-direction: column; }
+        .sub-btn {
+            background: #1e293b; color: #38bdf8; border: 1px solid rgba(56,189,248,0.3);
+            padding: 8px 12px; border-radius: 10px; font-size: 0.78rem; font-weight: bold;
+            cursor: pointer; text-align: center; flex: 1; white-space: nowrap; transition: background 0.2s ease;
+        }
+        .sub-btn.active { background: #2563eb; color: #fff; border-color: transparent; }
+        .btn-ui { background: rgba(15,23,42,0.9); color: #facc15; border: 1px solid rgba(250,204,21,0.4); }
+        .btn-route { background: linear-gradient(135deg, #ea580c, #c2410c); color: #fff; border: none; }
+        .btn-transit { background: #1e293b; color: #38bdf8; border: 1px solid rgba(56,189,248,0.4); }
+
+        .lever-panel {
+            position: absolute; bottom: 150px; right: 12px; z-index: 1000;
+            background: rgba(15,23,42,0.9); padding: 6px; border-radius: 12px;
+            backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.15);
+            display: flex; flex-direction: column; align-items: center; gap: 4px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+        }
+        .lever-row { display: flex; gap: 4px; }
+        .lever-btn {
+            background: #1e293b; color: #38bdf8; border: 1px solid rgba(56,189,248,0.3);
+            width: 32px; height: 32px; border-radius: 8px; font-weight: bold; font-size: 0.9rem;
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+        }
+        .lever-btn:active { background: #2563eb; color: #fff; }
+
+        .hud-panel {
+            position: absolute; bottom: 12px; left: 12px; right: 12px; z-index: 1000;
+            background: rgba(15,23,42,0.95); backdrop-filter: blur(16px); color: #fff;
+            padding: 10px 14px; border-radius: 16px; box-shadow: 0 15px 40px rgba(0,0,0,0.8);
+            border: 1px solid rgba(255,255,255,0.15);
+        }
+        .hud-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; text-align: center; }
+        .hud-item { background: rgba(255,255,255,0.04); padding: 4px 2px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.06); }
+        .hud-value { font-size: 1rem; font-weight: 800; color: #38bdf8; margin-top: 1px; }
+        .hud-label { font-size: 0.55rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.4px; }
+        .status-bar {
+            margin-top: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.1);
+            font-size: 0.68rem; color: #cbd5e1; display: flex; justify-content: space-between; align-items: center; gap: 8px;
+        }
+
+        .modal-overlay {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(3,7,18,0.88); z-index: 2000; flex-direction: column;
+            justify-content: center; align-items: center; padding: 15px; backdrop-filter: blur(8px);
+        }
+        .modal-container {
+            background: #1e293b; width: 100%; max-width: 500px; max-height: 88vh;
+            border-radius: 20px; display: flex; flex-direction: column; overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 25px 60px rgba(0,0,0,0.9);
+        }
+        .modal-header {
+            padding: 15px 20px; background: #0f172a; display: flex; justify-content: space-between;
+            align-items: center; font-weight: bold; font-size: 0.95rem; border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .close-btn { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        .modal-body { padding: 20px; color: #f8fafc; font-size: 0.9rem; display: flex; flex-direction: column; gap: 15px; overflow-y: auto; }
+        .form-group { display: flex; flex-direction: column; gap: 6px; }
+        .form-group label { font-size: 0.8rem; color: #94a3b8; font-weight: bold; }
+        .form-select, .form-input {
+            background: #0f172a; border: 1px solid rgba(255,255,255,0.15); color: #fff;
+            padding: 10px; border-radius: 10px; font-size: 0.9rem; outline: none; width: 100%;
+        }
+        .modal-footer { padding: 15px 20px; background: #0f172a; display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid rgba(255,255,255,0.1); }
+        .btn-primary { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 10px; font-weight: bold; cursor: pointer; }
+        .btn-secondary { background: #334155; color: #fff; border: none; padding: 10px 16px; border-radius: 10px; font-weight: bold; cursor: pointer; }
+
+        .search-result {
+            background: #0f172a; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
+            padding: 10px 12px; cursor: pointer; font-size: 0.85rem; line-height: 1.4;
+        }
+        .search-result:active { background: #1e3a8a; }
+        .route-step { font-size: 0.8rem; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); line-height: 1.4; }
+        .route-summary { font-size: 1rem; font-weight: 800; color: #4ade80; }
+
+        .toast {
+            position: absolute; top: 120px; left: 12px; z-index: 1000;
+            background: rgba(15,23,42,0.95); border: 1px solid rgba(56,189,248,0.4);
+            padding: 6px 12px; border-radius: 8px; font-size: 0.72rem; color: #38bdf8;
+            pointer-events: none; backdrop-filter: blur(10px); max-width: 70vw;
+        }
+        body.ui-hidden .toast { display: none; }
+
+        .facility-icon {
+            font-size: 15px; line-height: 22px; text-align: center;
+            background: rgba(15,23,42,0.85); border: 1.5px solid #fff; border-radius: 50%;
+            width: 22px !important; height: 22px !important; box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+        }
+        .leaflet-popup-content { font-size: 0.85rem; line-height: 1.5; }
+    </style>
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#0f172a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="./icon-192.png">
+</head>
+<body>
+
+    <button class="persistent-restore-btn" onclick="toggleUI()">👁️ UIを表示する</button>
+
+    <!-- バードビュー時の空（地図の背面・上部約30%に見える） -->
+    <div class="bird-sky" aria-hidden="true">
+        <div class="sun"></div>
+        <div class="cloud c1"></div>
+        <div class="cloud c2"></div>
+        <div class="cloud c3"></div>
+        <div class="cloud c4"></div>
+    </div>
+    <div id="map"></div>
+    <div class="bird-badge">🦅 バードビュー <span id="birdAngleDisplay">34°</span>（追従専用・2本指で上下スライドすると角度変更）</div>
+
+    <div class="toast" id="toastMsg">v4 起動中…</div>
+
+    <!-- 上部タイルバー：施設表示はOverpass(OSM実データ)で実際に検索する -->
+    <div class="top-tile-bar">
+        <button class="tile-btn btn-barrier" id="btn-barrier" onclick="toggleFacility('barrier')">♿ バリアフリー</button>
+        <button class="tile-btn btn-station" id="btn-station" onclick="toggleFacility('station')">🚉 鉄道駅</button>
+        <button class="tile-btn btn-bus" id="btn-bus" onclick="toggleFacility('bus')">🚏 バス停</button>
+        <button class="tile-btn btn-hospital" id="btn-hospital" onclick="toggleFacility('hospital')">🏥 病院</button>
+        <button class="tile-btn btn-cvs" id="btn-cvs" onclick="toggleFacility('cvs')">🏪 コンビニ</button>
+        <button class="tile-btn btn-gs" id="btn-gs" onclick="toggleFacility('gs')">⛽ GS</button>
+        <button class="tile-btn btn-csv" onclick="exportCsvLog()">💾 CSV保存</button>
+    </div>
+
+    <!-- 右側コントロールパネル群 -->
+    <div class="control-panel-group">
+        <div class="panel-box">
+            <button class="tile-btn btn-ui" style="padding:8px 12px; font-size:0.75rem;" onclick="toggleUI()">👁️ UI非表示</button>
+            <button class="tile-btn btn-route" style="padding:8px 12px; font-size:0.75rem;" onclick="openSearchModal()">🧭 ルート検索</button>
+        </div>
+        <div class="panel-box vertical">
+            <div style="display: flex; gap: 4px;">
+                <button class="sub-btn" id="mode-all" onclick="setViewMode('all')">全体</button>
+                <button class="sub-btn" id="mode-2d" onclick="setViewMode('flat2d')">平面2D</button>
+                <button class="sub-btn" id="mode-bird" onclick="setViewMode('bird')">🦅 バード</button>
+            </div>
+            <div style="display: flex; gap: 4px;">
+                <button class="sub-btn active" id="layer-map" onclick="setLayer('map')">マップ</button>
+                <button class="sub-btn" id="layer-sat" onclick="setLayer('satellite')">衛星写真</button>
+            </div>
+            <div style="display: flex; gap: 4px;">
+                <button class="sub-btn" id="mode-cond" onclick="openRouteConditionsModal()">⚙️ ルート条件</button>
+            </div>
+        </div>
+        <div class="panel-box vertical">
+            <button class="tile-btn btn-transit" onclick="openTransitSearch()">🚇 乗換案内 (外部)</button>
+            <button class="sub-btn active" id="followBtn" onclick="toggleFollow()">📍 追従: ON</button>
+            <button class="sub-btn" onclick="resetCalibration()">🔄 フィルタ初期化</button>
+        </div>
+    </div>
+
+    <!-- 右下 レバー風ズーム操作タイル -->
+    <div class="lever-panel">
+        <button class="lever-btn" onclick="zoomIn()">➕</button>
+        <div class="lever-row">
+            <button class="lever-btn" onclick="panMap('left')">◀</button>
+            <button class="lever-btn" onclick="panMap('right')">▶</button>
+        </div>
+        <button class="lever-btn" onclick="zoomOut()">➖</button>
+    </div>
+
+    <!-- 下部 HUDダッシュボードパネル -->
+    <div class="hud-panel">
+        <div class="hud-grid">
+            <div class="hud-item">
+                <div class="hud-label">速度</div>
+                <div class="hud-value" id="speedDisplay">0 <span style="font-size: 0.55rem;">km/h</span></div>
+            </div>
+            <div class="hud-item">
+                <div class="hud-label">GPS精度</div>
+                <div class="hud-value" id="accuracyDisplay" style="color: #facc15;">--- m</div>
+            </div>
+            <div class="hud-item">
+                <div class="hud-label">フィルタ</div>
+                <div class="hud-value" id="matchStatus" style="color: #4ade80;">待機</div>
+            </div>
+            <div class="hud-item">
+                <div class="hud-label">方位角</div>
+                <div class="hud-value" id="headingDisplay" style="font-size: 0.9rem;">---°</div>
+            </div>
+        </div>
+        <div class="status-bar">
+            <span id="statusMessage">GPS測位待機中... (高精度モード有効)</span>
+            <span id="coordDisplay">緯度経度: 未取得</span>
+        </div>
+    </div>
+
+    <!-- ルート検索モーダル -->
+    <div class="modal-overlay" id="searchModal">
+        <div class="modal-container">
+            <div class="modal-header">
+                <span>🧭 ルート検索（目的地）</span>
+                <button class="close-btn" onclick="closeSearchModal()">閉じる</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>目的地（地名・施設名・住所）</label>
+                    <div style="display:flex; gap:6px;">
+                        <input class="form-input" id="destInput" type="text" placeholder="例：松原市民体育館">
+                        <button class="btn-primary" style="white-space:nowrap;" onclick="searchDestination()">検索</button>
+                    </div>
+                </div>
+                <div id="searchResults" style="display:flex; flex-direction:column; gap:6px;"></div>
+                <div id="routeInfo" style="display:none; flex-direction:column; gap:6px;">
+                    <div class="route-summary" id="routeSummary"></div>
+                    <div id="routeSteps"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="clearRoute()">ルート消去</button>
+                <button class="btn-primary" onclick="closeSearchModal()">地図に戻る</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ルート探索条件モーダル（実際にOSRMへ渡す項目だけ） -->
+    <div class="modal-overlay" id="routeConditionsModal">
+        <div class="modal-container">
+            <div class="modal-header">
+                <span>ルート探索条件の設定</span>
+                <button class="close-btn" onclick="closeRouteConditionsModal()">閉じる</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>有料道路（高速・有料道）の利用</label>
+                    <select class="form-select" id="optTollRoad">
+                        <option value="prefer">有料道路を優先（利用する）</option>
+                        <option value="avoid">有料道路を使わない（一般道優先）</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>探索タイプ</label>
+                    <select class="form-select" id="optRouteType">
+                        <option value="fast">推奨ルート（時間優先）</option>
+                        <option value="free">一般道のみ（高速・有料道を除外）</option>
+                    </select>
+                </div>
+                <div style="font-size:0.75rem; color:#94a3b8; line-height:1.5;">
+                    ※ 無料の経路計算（OSRM）を使うため、ETC割引とリアルタイム渋滞迂回は対象外です。渋滞は iHighway 等で確認してください。
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" onclick="saveRouteConditions()">条件を保存して適用</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const CONFIG = {
+            DEFAULT_LAT: 34.5734,
+            DEFAULT_LNG: 135.4830,
+            MAX_LOGS: 800,
+            MAX_PLAUSIBLE_SPEED: 55,
+            ACCURACY_REJECT: 200
+        };
+
+        const savedState = JSON.parse(localStorage.getItem('nav_app_state') || '{}');
+        const initLat = savedState.lat || CONFIG.DEFAULT_LAT;
+        const initLng = savedState.lng || CONFIG.DEFAULT_LNG;
+        const initZoom = savedState.zoom || 15;
+
+        const map = L.map('map', { zoomControl: false }).setView([initLat, initLng], initZoom);
+
+        const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' });
+        const satLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: '&copy; Esri' });
+        if (savedState.layer === 'satellite') {
+            satLayer.addTo(map);
+            document.getElementById('layer-map').classList.remove('active');
+            document.getElementById('layer-sat').classList.add('active');
+        } else {
+            osmLayer.addTo(map);
+        }
+
+        let marker = null;
+        let accuracyCircle = null;
+        let trackPolyline = L.polyline([], { color: '#38bdf8', weight: 3, opacity: 0.55 }).addTo(map);
+        let routePolyline = null;
+        let destMarker = null;
+        let currentDest = null;
+
+        let isFirstFix = true;
+        let isFollowing = true;
+        let isUiVisible = true;
+        let positionLogs = [];
+        let currentPos = null;
+
+        let currentViewMode = 'flat2d';
+
+        // バードビューの傾斜角度（°）。2本指スライドで 5°〜60° の範囲で変える
+        const BIRD_TILT_MIN = 5, BIRD_TILT_MAX = 60;
+        let birdTilt = (savedState.birdTilt != null && !isNaN(savedState.birdTilt))
+            ? Math.min(BIRD_TILT_MAX, Math.max(BIRD_TILT_MIN, Number(savedState.birdTilt))) : 34;
+        function clampBirdTilt(v) { return Math.min(BIRD_TILT_MAX, Math.max(BIRD_TILT_MIN, v)); }
+        function applyBirdTilt() {
+            document.body.style.setProperty('--bird-tilt', birdTilt + 'deg');
+            // 地平線（霞の帯）の位置も角度に連動させる：34°で約30vh
+            document.body.style.setProperty('--bird-horizon', (birdTilt * 0.88).toFixed(1) + 'vh');
+            const el = document.getElementById('birdAngleDisplay');
+            if (el) el.textContent = Math.round(birdTilt) + '°';
+        }
+
+        function saveAppState() {
+            const center = map.getCenter();
+            const state = {
+                lat: center.lat, lng: center.lng, zoom: map.getZoom(),
+                facilities: activeFacilities,
+                viewMode: currentViewMode,
+                birdTilt: Math.round(birdTilt * 10) / 10,
+                layer: map.hasLayer(satLayer) ? 'satellite' : 'map'
+            };
+            localStorage.setItem('nav_app_state', JSON.stringify(state));
+        }
+
+        let lastAccepted = null;
+        let consecutiveOutliers = 0;
+        let lastFiltered = null;
+
+        const kalman = {
+            lat: null, lng: null, variance: -1, timestamp: 0, Q: 5,
+            process: function (lat, lng, accuracy, timestamp) {
+                if (this.variance < 0) {
+                    this.lat = lat; this.lng = lng;
+                    this.variance = accuracy * accuracy;
+                    this.timestamp = timestamp;
+                } else {
+                    const dt = timestamp - this.timestamp;
+                    if (dt > 0) {
+                        this.variance += (dt / 1000) * this.Q * this.Q;
+                        this.timestamp = timestamp;
+                    }
+                    const K = this.variance / (this.variance + accuracy * accuracy);
+                    this.lat += K * (lat - this.lat);
+                    this.lng += K * (lng - this.lng);
+                    this.variance = (1 - K) * this.variance;
+                }
+                return [this.lat, this.lng];
+            },
+            reset: function () { this.variance = -1; }
+        };
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        function setMatchStatus(text, color) {
+            const el = document.getElementById('matchStatus');
+            el.textContent = text;
+            el.style.color = color;
+        }
+
+        function handlePosition(position) {
+            const rawLat = position.coords.latitude;
+            const rawLng = position.coords.longitude;
+            const accuracy = position.coords.accuracy;
+            const speedMs = position.coords.speed;
+            const heading = position.coords.heading;
+            const now = position.timestamp || Date.now();
+
+            document.getElementById('accuracyDisplay').textContent = Math.round(accuracy) + ' m';
+            document.getElementById('coordDisplay').textContent = '緯度: ' + rawLat.toFixed(5) + ', 経度: ' + rawLng.toFixed(5);
+
+            if (accuracy > CONFIG.ACCURACY_REJECT) {
+                setMatchStatus('精度不足', '#f87171');
+                document.getElementById('statusMessage').textContent = '⚠️ GPS精度低下中（精度 ' + Math.round(accuracy) + 'm のため位置は保留）';
+                return;
+            }
+
+            if (lastAccepted) {
+                const dist = calculateDistance(lastAccepted.lat, lastAccepted.lng, rawLat, rawLng);
+                const dtSec = Math.max((now - lastAccepted.time) / 1000, 0.1);
+                if (dist / dtSec > CONFIG.MAX_PLAUSIBLE_SPEED) {
+                    consecutiveOutliers++;
+                    if (consecutiveOutliers < 3) {
+                        setMatchStatus('飛び棄却', '#f87171');
+                        document.getElementById('statusMessage').textContent = '⚠️ 位置の飛びを検出（棄却中）';
+                        return;
+                    }
+                    kalman.reset();
+                } else {
+                    consecutiveOutliers = 0;
+                }
+            }
+            lastAccepted = { lat: rawLat, lng: rawLng, time: now };
+
+            const filtered = kalman.process(rawLat, rawLng, Math.max(accuracy, 5), now);
+            const fLat = filtered[0], fLng = filtered[1];
+            currentPos = { lat: fLat, lng: fLng };
+
+            let displaySpeedMs = speedMs;
+            if ((displaySpeedMs === null || isNaN(displaySpeedMs)) && lastFiltered) {
+                const d = calculateDistance(lastFiltered.lat, lastFiltered.lng, fLat, fLng);
+                const dtSec = (now - lastFiltered.time) / 1000;
+                if (dtSec > 0.5) displaySpeedMs = d / dtSec;
+            }
+            if (displaySpeedMs !== null && !isNaN(displaySpeedMs)) {
+                document.getElementById('speedDisplay').innerHTML = Math.round(displaySpeedMs * 3.6) + ' <span style="font-size: 0.55rem;">km/h</span>';
+            }
+            lastFiltered = { lat: fLat, lng: fLng, time: now };
+
+            if (heading !== null && !isNaN(heading) && displaySpeedMs > 1) {
+                document.getElementById('headingDisplay').textContent = Math.round(heading) + '°';
+            }
+
+            if (accuracy > 100) {
+                setMatchStatus('補正中', '#facc15');
+                document.getElementById('statusMessage').textContent = '⚠️ GPS精度低下中（高架下・ビル街の可能性）';
+            } else {
+                setMatchStatus('安定', '#4ade80');
+                document.getElementById('statusMessage').textContent = '🟢 高精度測位中（ブレ補正フィルタ適用中）';
+            }
+
+            const latLng = [fLat, fLng];
+            positionLogs.push({ lat: fLat, lng: fLng, time: new Date(now).toISOString() });
+            if (positionLogs.length > CONFIG.MAX_LOGS) positionLogs.shift();
+            trackPolyline.setLatLngs(positionLogs.map(p => [p.lat, p.lng]));
+
+            if (!marker) {
+                marker = L.circleMarker(latLng, { radius: 10, color: '#ffffff', weight: 3, fillColor: '#2563eb', fillOpacity: 1 }).addTo(map);
+                accuracyCircle = L.circle(latLng, { radius: accuracy, color: '#38bdf8', fillColor: '#38bdf8', fillOpacity: 0.15 }).addTo(map);
+            } else {
+                marker.setLatLng(latLng);
+                accuracyCircle.setLatLng(latLng);
+                accuracyCircle.setRadius(accuracy);
+            }
+
+            if (isFirstFix) {
+                map.setView(latLng, 16);
+                isFirstFix = false;
+                if (currentViewMode === 'bird') applyBirdOffset();
+            } else if (isFollowing) {
+                if (currentViewMode === 'bird') {
+                    map.panTo(birdOffsetLatLng(latLng), { animate: true });
+                } else {
+                    map.panTo(latLng, { animate: true });
+                }
+            }
+        }
+
+        function handleError(error) {
+            let msg = '位置情報エラー: ';
+            switch (error.code) {
+                case error.PERMISSION_DENIED: msg += '許可されませんでした'; break;
+                case error.POSITION_UNAVAILABLE: msg += '位置情報が取得できません'; break;
+                case error.TIMEOUT: msg += 'タイムアウトしました'; break;
+                default: msg += '取得できません';
+            }
+            document.getElementById('statusMessage').textContent = msg;
+            document.getElementById('statusMessage').style.color = '#f87171';
+        }
+
+        if (navigator.geolocation) {
+            navigator.geolocation.watchPosition(handlePosition, handleError, {
+                enableHighAccuracy: true, maximumAge: 0, timeout: 10000
+            });
+        } else {
+            document.getElementById('statusMessage').textContent = 'このブラウザは位置情報に対応していません。';
+            document.getElementById('statusMessage').style.color = '#f87171';
+        }
+
+        function calculateDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        function updateFollowBtn() {
+            const btn = document.getElementById('followBtn');
+            btn.textContent = isFollowing ? '📍 追従: ON' : '📍 追従: OFF';
+            btn.classList.toggle('active', isFollowing);
+        }
+        function toggleFollow() {
+            // バードビューは追従専用：追従を切る操作をしたら平面2Dに戻す
+            if (currentViewMode === 'bird' && isFollowing) {
+                setViewMode('flat2d');
+            }
+            isFollowing = !isFollowing;
+            updateFollowBtn();
+            if (isFollowing && marker) {
+                if (currentViewMode === 'bird') applyBirdOffset();
+                else map.panTo(marker.getLatLng(), { animate: true });
+                showToast('現在地に追従中');
+            }
+        }
+        map.on('dragstart', () => {
+            if (isFollowing) { isFollowing = false; updateFollowBtn(); showToast('追従一時停止'); }
+        });
+
+        // バードビュー用：自位置が画面の下寄りに来るよう、中心を少し先（上方向）へずらす
+        function birdOffsetLatLng(latLng) {
+            try {
+                const pt = map.project(latLng, map.getZoom());
+                pt.y -= window.innerHeight * 0.20;
+                return map.unproject(pt, map.getZoom());
+            } catch (e) { return latLng; }
+        }
+        function applyBirdOffset() {
+            if (marker) map.panTo(birdOffsetLatLng(marker.getLatLng()), { animate: true });
+        }
+
+        // ===== バードビュー：2本指スライドで角度変更 =====
+        // 2本指を一緒に上下へ滑らせた量（重心の移動）だけ傾きを変える。
+        // 上へスライド → 傾きが大きくなる（地平線が上がり空が広がる）
+        // 下へスライド → 傾きが小さくなる（平面2Dに近づく）
+        // 指を広げる/閉じるピンチは重心がほぼ動かないので角度は変わらない。
+        let birdGesture = null;
+        const birdMapEl = document.getElementById('map');
+        function birdCentroidY(touches) { return (touches[0].clientY + touches[1].clientY) / 2; }
+        birdMapEl.addEventListener('touchstart', function (e) {
+            if (currentViewMode !== 'bird') return;
+            if (e.touches.length === 2) {
+                birdGesture = { startY: birdCentroidY(e.touches), startTilt: birdTilt };
+                document.body.classList.add('bird-gesturing');
+                if (e.cancelable) e.preventDefault();
+            }
+        }, { passive: false });
+        birdMapEl.addEventListener('touchmove', function (e) {
+            if (currentViewMode !== 'bird' || !birdGesture) return;
+            if (e.touches.length !== 2) return;
+            if (e.cancelable) e.preventDefault();
+            const dy = birdGesture.startY - birdCentroidY(e.touches);
+            // 約7pxのスライドで1°（200px滑らせると約30°変わる）
+            birdTilt = clampBirdTilt(birdGesture.startTilt + dy * 0.15);
+            applyBirdTilt();
+        }, { passive: false });
+        function endBirdGesture(e) {
+            if (!birdGesture) return;
+            if (e.touches && e.touches.length >= 2) return;
+            birdGesture = null;
+            document.body.classList.remove('bird-gesturing');
+            saveAppState();
+            showToast('バード角度：' + Math.round(birdTilt) + '°');
+        }
+        birdMapEl.addEventListener('touchend', endBirdGesture);
+        birdMapEl.addEventListener('touchcancel', endBirdGesture);
+
+        function setViewMode(mode, save) {
+            if (save === undefined) save = true;
+            currentViewMode = mode;
+            document.getElementById('mode-all').classList.toggle('active', mode === 'all');
+            document.getElementById('mode-2d').classList.toggle('active', mode === 'flat2d');
+            const birdBtn = document.getElementById('mode-bird');
+            if (birdBtn) birdBtn.classList.toggle('active', mode === 'bird');
+
+            if (mode === 'bird') {
+                applyBirdTilt();
+                document.body.classList.add('bird-view-active');
+                // コンテナが横150%に広がった直後にサイズを再計算させ、左右の広い範囲を描かせる
+                // （傾きアニメーション完了後の650ms時点でもう一度呼ぶ）
+                void document.getElementById('map').offsetWidth;
+                map.invalidateSize();
+                // 傾けた地図はドラッグ座標がずれるため、バード中はドラッグを止めて追従専用にする
+                // （ズームボタンと現在地追従はそのまま使える）
+                if (map.dragging) map.dragging.disable();
+                if (map.touchZoom) map.touchZoom.disable();
+                if (map.doubleClickZoom) map.doubleClickZoom.disable();
+                isFollowing = true; updateFollowBtn();
+                // 表示範囲を広くするため、バード時はズーム16を上限にする（従来は17固定で狭かった）
+                if (map.getZoom() > 16) map.setZoom(16);
+                setTimeout(() => { map.invalidateSize(); applyBirdOffset(); }, 650);
+                showToast('🦅 バードビュー：2本指で上下スライドすると角度が変わります（現在 ' + Math.round(birdTilt) + '°）');
+            } else {
+                const wasBird = document.body.classList.contains('bird-view-active');
+                birdGesture = null;
+                document.body.classList.remove('bird-gesturing');
+                document.body.classList.remove('bird-view-active');
+                if (wasBird) { void document.getElementById('map').offsetWidth; map.invalidateSize(); }
+                if (map.dragging) map.dragging.enable();
+                if (map.touchZoom) map.touchZoom.enable();
+                if (map.doubleClickZoom) map.doubleClickZoom.enable();
+                if (mode === 'all') { map.setZoom(13); showToast('全体表示モード'); }
+                else if (save) { map.setZoom(16); showToast('平面2Dモード'); }
+                if (wasBird) {
+                    setTimeout(() => { map.invalidateSize(); if (isFollowing && marker) map.panTo(marker.getLatLng(), { animate: true }); }, 650);
+                }
+            }
+            if (save) saveAppState();
+        }
+
+        function setLayer(type) {
+            document.getElementById('layer-map').classList.remove('active');
+            document.getElementById('layer-sat').classList.remove('active');
+            if (type === 'map') {
+                map.removeLayer(satLayer); osmLayer.addTo(map);
+                document.getElementById('layer-map').classList.add('active');
+                showToast('マップビューに変更');
+            } else {
+                map.removeLayer(osmLayer); satLayer.addTo(map);
+                document.getElementById('layer-sat').classList.add('active');
+                showToast('衛星写真モードに変更');
+            }
+            saveAppState();
+        }
+
+        function zoomIn() { map.zoomIn(); }
+        function zoomOut() { map.zoomOut(); }
+        function panMap(direction) {
+            if (currentViewMode === 'bird') { showToast('バードビュー中は追従専用です（平面2Dで移動できます）'); return; }
+            const offset = 100;
+            if (direction === 'left') map.panBy([-offset, 0]);
+            if (direction === 'right') map.panBy([offset, 0]);
+        }
+
+        function toggleUI() {
+            isUiVisible = !isUiVisible;
+            document.body.classList.toggle('ui-hidden', !isUiVisible);
+            if (isUiVisible) showToast('UIを表示しました');
+        }
+
+        function resetCalibration() {
+            kalman.reset();
+            lastAccepted = null; lastFiltered = null; consecutiveOutliers = 0;
+            positionLogs = []; trackPolyline.setLatLngs([]);
+            showToast('測位フィルタと走行ログを初期化しました');
+        }
+
+        function openTransitSearch() {
+            window.open('https://www.google.co.jp/transit', '_blank');
+            showToast('乗換案内を別タブで開きました');
+        }
+
+        const FACILITY_DEFS = {
+            barrier:  { label: 'バリアフリー（多目的トイレ）', icon: '♿', queries: ['node["amenity"="toilets"]["wheelchair"="yes"]', 'node["amenity"="toilets"]["wheelchair"="designated"]'] },
+            station:  { label: '鉄道駅', icon: '🚉', queries: ['node["railway"="station"]'] },
+            bus:      { label: 'バス停', icon: '🚏', queries: ['node["highway"="bus_stop"]'] },
+            hospital: { label: '病院', icon: '🏥', queries: ['node["amenity"="hospital"]', 'way["amenity"="hospital"]', 'node["amenity"="clinic"]', 'way["amenity"="clinic"]'] },
+            cvs:      { label: 'コンビニ', icon: '🏪', queries: ['node["shop"="convenience"]', 'way["shop"="convenience"]'] },
+            gs:       { label: 'ガソリンスタンド', icon: '⛽', queries: ['node["amenity"="fuel"]', 'way["amenity"="fuel"]'] }
+        };
+        let activeFacilities = savedState.facilities || { barrier: false, station: false, bus: false, hospital: false, cvs: false, gs: false };
+        const facilityLayers = {};
+        Object.keys(FACILITY_DEFS).forEach(t => { facilityLayers[t] = L.layerGroup(); });
+        let lastFacilityFetch = { center: null, time: 0 };
+
+        Object.keys(activeFacilities).forEach(type => {
+            if (activeFacilities[type]) {
+                document.getElementById('btn-' + type).classList.add('on');
+                facilityLayers[type].addTo(map);
+            }
+        });
+
+        async function toggleFacility(type) {
+            activeFacilities[type] = !activeFacilities[type];
+            const btn = document.getElementById('btn-' + type);
+            btn.classList.toggle('on', activeFacilities[type]);
+            if (activeFacilities[type]) {
+                facilityLayers[type].addTo(map);
+                showToast(FACILITY_DEFS[type].label + 'を検索中…');
+                await fetchFacilities(type);
+            } else {
+                map.removeLayer(facilityLayers[type]);
+                facilityLayers[type].clearLayers();
+                showToast(FACILITY_DEFS[type].label + 'を非表示');
+            }
+            saveAppState();
+        }
+
+        async function fetchFacilities(type) {
+            const def = FACILITY_DEFS[type];
+            const center = currentPos || map.getCenter();
+            const cLat = center.lat, cLng = center.lng;
+            const radius = map.getZoom() <= 13 ? 4000 : 2000;
+            const parts = def.queries.map(q => q + '(around:' + radius + ',' + cLat + ',' + cLng + ');').join('');
+            const query = '[out:json][timeout:20];(' + parts + ');out center 80;';
+            try {
+                const res = await fetch('https://overpass-api.de/api/interpreter', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'data=' + encodeURIComponent(query)
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                facilityLayers[type].clearLayers();
+                let count = 0;
+                (data.elements || []).forEach(el => {
+                    const lat = el.lat !== undefined ? el.lat : (el.center && el.center.lat);
+                    const lon = el.lon !== undefined ? el.lon : (el.center && el.center.lon);
+                    if (lat === undefined || lon === undefined) return;
+                    const name = (el.tags && (el.tags.name || el.tags['name:ja'])) || def.label;
+                    const icon = L.divIcon({ className: '', html: '<div class="facility-icon">' + def.icon + '</div>', iconSize: [22, 22], iconAnchor: [11, 11] });
+                    const m = L.marker([lat, lon], { icon: icon });
+                    const safeNameHtml = escapeHtml(name);
+                    const safeNameJs = String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+                    let distText = '';
+                    if (currentPos) {
+                        const d = calculateDistance(currentPos.lat, currentPos.lng, lat, lon);
+                        distText = '<br>現在地から約 ' + (d >= 1000 ? (d / 1000).toFixed(1) + ' km' : Math.round(d) + ' m');
+                    }
+                    m.bindPopup('<b>' + safeNameHtml + '</b><br>' + escapeHtml(def.label) + distText + '<br><a href="#" onclick="routeToPoint(' + lat + ',' + lon + ',\'' + safeNameJs + '\');return false;">ここへルート検索</a>');
+                    m.addTo(facilityLayers[type]);
+                    count++;
+                });
+                showToast(def.label + '：' + count + '件（半径' + (radius / 1000) + 'km圏）');
+                lastFacilityFetch = { center: map.getCenter(), time: Date.now() };
+            } catch (e) {
+                showToast(def.label + 'の取得に失敗（通信エラー）');
+            }
+        }
+
+        let facilityRefetchTimer = null;
+        map.on('moveend', () => {
+            saveAppState();
+            const active = Object.keys(activeFacilities).filter(t => activeFacilities[t]);
+            if (active.length === 0) return;
+            if (Date.now() - lastFacilityFetch.time < 10000) return;
+            if (lastFacilityFetch.center && calculateDistance(lastFacilityFetch.center.lat, lastFacilityFetch.center.lng, map.getCenter().lat, map.getCenter().lng) < 500) return;
+            clearTimeout(facilityRefetchTimer);
+            facilityRefetchTimer = setTimeout(() => { active.forEach(t => fetchFacilities(t)); }, 1200);
+        });
+
+        function openSearchModal() { document.getElementById('searchModal').style.display = 'flex'; }
+        function closeSearchModal() { document.getElementById('searchModal').style.display = 'none'; }
+
+        async function searchDestination() {
+            const q = document.getElementById('destInput').value.trim();
+            const box = document.getElementById('searchResults');
+            if (!q) { showToast('目的地を入力してください'); return; }
+            box.innerHTML = '<div style="font-size:0.85rem; color:#94a3b8;">検索中…</div>';
+            try {
+                const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=6&countrycodes=jp&accept-language=ja&q=' + encodeURIComponent(q);
+                const res = await fetch(url);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const results = await res.json();
+                if (!results.length) { box.innerHTML = '<div style="font-size:0.85rem;">見つかりませんでした</div>'; return; }
+                box.innerHTML = '';
+                results.forEach(r => {
+                    const div = document.createElement('div');
+                    div.className = 'search-result';
+                    div.textContent = r.display_name;
+                    div.onclick = () => {
+                        closeSearchModal();
+                        routeToPoint(parseFloat(r.lat), parseFloat(r.lon), r.display_name.split(',')[0]);
+                    };
+                    box.appendChild(div);
+                });
+            } catch (e) {
+                box.innerHTML = '<div style="font-size:0.85rem;">検索に失敗しました（通信エラー）</div>';
+            }
+        }
+
+        function getRouteOpts() {
+            return JSON.parse(localStorage.getItem('nav_route_opts') || '{"tollRoad":"prefer","routeType":"fast"}');
+        }
+
+        async function routeToPoint(lat, lon, name) {
+            // ルート全体は傾けていない平面で見る方が正確なので、バード中なら2Dへ戻す
+            if (currentViewMode === 'bird') setViewMode('flat2d');
+            const start = currentPos || map.getCenter();
+            const sLat = start.lat, sLng = start.lng;
+            currentDest = { lat: lat, lon: lon, name: name };
+            showToast('ルート計算中…');
+            const opts = getRouteOpts();
+            const exclude = (opts.tollRoad === 'avoid' || opts.routeType === 'free') ? '&exclude=motorway,toll' : '';
+            const base = 'https://router.project-osrm.org/route/v1/driving/' + sLng + ',' + sLat + ';' + lon + ',' + lat + '?overview=full&geometries=geojson&steps=true';
+            try {
+                let res = await fetch(base + exclude);
+                let data = await res.json();
+                if ((!data.routes || !data.routes.length) && exclude) {
+                    res = await fetch(base);
+                    data = await res.json();
+                    if (data.routes && data.routes.length) showToast('有料道の除外は使えなかったため通常ルートで表示');
+                }
+                if (!data.routes || !data.routes.length) { showToast('ルートが見つかりませんでした'); return; }
+                const route = data.routes[0];
+                const latlngs = route.geometry.coordinates.map(c => [c[1], c[0]]);
+                if (routePolyline) map.removeLayer(routePolyline);
+                if (destMarker) map.removeLayer(destMarker);
+                routePolyline = L.polyline(latlngs, { color: '#f97316', weight: 6, opacity: 0.85 }).addTo(map);
+                destMarker = L.marker([lat, lon]).addTo(map).bindPopup('<b>' + escapeHtml(name) + '</b>');
+                map.fitBounds(routePolyline.getBounds(), { padding: [40, 40] });
+
+                const km = (route.distance / 1000).toFixed(1);
+                const min = Math.round(route.duration / 60);
+                document.getElementById('routeInfo').style.display = 'flex';
+                document.getElementById('routeSummary').textContent = name + ' まで 約' + km + ' km / 約' + min + ' 分';
+                const stepsBox = document.getElementById('routeSteps');
+                stepsBox.innerHTML = '';
+                const steps = (route.legs && route.legs[0] && route.legs[0].steps) || [];
+                steps.slice(0, 10).forEach(st => {
+                    const div = document.createElement('div');
+                    div.className = 'route-step';
+                    const road = st.name || '（名称なし道路）';
+                    const d = st.distance >= 1000 ? (st.distance / 1000).toFixed(1) + ' km' : Math.round(st.distance) + ' m';
+                    const mv = st.maneuver || {};
+                    let action = '直進';
+                    if (mv.type === 'depart') action = '出発';
+                    else if (mv.type === 'arrive') action = '到着';
+                    else if (mv.type === 'turn' || mv.type === 'end of road' || mv.type === 'new name') {
+                        if (mv.modifier && mv.modifier.includes('left')) action = '左折';
+                        else if (mv.modifier && mv.modifier.includes('right')) action = '右折';
+                        else action = '進路変更';
+                    } else if (mv.type === 'merge') action = '合流';
+                    else if (mv.type === 'roundabout' || mv.type === 'rotary') action = 'ロータリー';
+                    else if (mv.type === 'on ramp' || mv.type === 'off ramp') action = 'ランプ';
+                    div.textContent = action + '：' + road + '（' + d + '）';
+                    stepsBox.appendChild(div);
+                });
+                showToast('ルート表示：約' + km + 'km / 約' + min + '分');
+            } catch (e) {
+                showToast('ルート計算に失敗しました（通信エラー）');
+            }
+        }
+
+        function clearRoute() {
+            if (routePolyline) { map.removeLayer(routePolyline); routePolyline = null; }
+            if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+            currentDest = null;
+            document.getElementById('routeInfo').style.display = 'none';
+            showToast('ルートを消去しました');
+        }
+
+        function openRouteConditionsModal() {
+            const opts = getRouteOpts();
+            document.getElementById('optTollRoad').value = opts.tollRoad || 'prefer';
+            document.getElementById('optRouteType').value = opts.routeType || 'fast';
+            document.getElementById('routeConditionsModal').style.display = 'flex';
+        }
+        function closeRouteConditionsModal() { document.getElementById('routeConditionsModal').style.display = 'none'; }
+        function saveRouteConditions() {
+            const opts = {
+                tollRoad: document.getElementById('optTollRoad').value,
+                routeType: document.getElementById('optRouteType').value
+            };
+            localStorage.setItem('nav_route_opts', JSON.stringify(opts));
+            closeRouteConditionsModal();
+            showToast('ルート条件を保存しました');
+            if (currentDest) routeToPoint(currentDest.lat, currentDest.lon, currentDest.name);
+        }
+
+        function exportCsvLog() {
+            if (positionLogs.length === 0) { showToast('ログがありません'); return; }
+            let csv = "data:text/csv;charset=utf-8,Latitude,Longitude,Timestamp\n";
+            positionLogs.forEach(r => csv += r.lat + ',' + r.lng + ',' + r.time + '\n');
+            const link = document.createElement("a");
+            link.href = encodeURI(csv);
+            link.download = 'gps_log_' + Date.now() + '.csv';
+            document.body.appendChild(link); link.click(); document.body.removeChild(link);
+            showToast('CSV保存完了');
+        }
+
+        function showToast(msg) {
+            const t = document.getElementById('toastMsg');
+            t.textContent = msg;
+            setTimeout(() => { if (t.textContent === msg) t.textContent = 'v4 稼働中'; }, 3500);
+        }
+
+        window.addEventListener('resize', () => { map.invalidateSize(); });
+        applyBirdTilt();
+        updateFollowBtn();
+        // 前回のビューモード（バード含む）を復元する
+        if (savedState.viewMode === 'bird' || savedState.viewMode === 'all') {
+            setViewMode(savedState.viewMode, false);
+        } else {
+            setViewMode('flat2d', false);
+        }
+        Object.keys(activeFacilities).forEach(t => { if (activeFacilities[t]) fetchFacilities(t); });
+        showToast('v4 稼働中（測位フィルタ＋実データ施設・ルート＋バードビュー）');
+    </script>
+<script>
+if ('serviceWorker' in navigator && window.isSecureContext) {
+ navigator.serviceWorker.register('./sw.js').catch(console.warn);
+}
+</script></body>
+</html>
